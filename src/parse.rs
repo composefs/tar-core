@@ -291,6 +291,16 @@ pub enum ParseError {
         /// Position in the stream where EOF occurred.
         pos: u64,
     },
+
+    /// A single all-zero 512-byte block was encountered mid-stream.
+    ///
+    /// A valid end-of-archive requires two consecutive zero blocks (POSIX).
+    /// GNU tar and Go's archive/tar treat a lone zero block as an error or
+    /// end-of-archive, never silently skipping it. Skipping it would let
+    /// entries after the zero block be visible to tar-core but hidden from
+    /// other parsers — an archive confusion vector.
+    #[error("stray zero block in archive")]
+    StrayZeroBlock,
 }
 
 /// Result type for parsing operations.
@@ -840,11 +850,11 @@ impl Parser {
                     * HEADER_SIZE;
                 return Ok(ParseEvent::End { consumed });
             }
-            // Not end of archive — single stray zero block; skip it and
-            // continue with the next block as a header.
-            return self
-                .parse_header(&input[HEADER_SIZE..], slices)
-                .map(|e| e.add_consumed(HEADER_SIZE));
+            // Not end of archive — single stray zero block.  Silently
+            // skipping it would let entries after the zero block be visible
+            // to tar-core but hidden from Go's archive/tar (which errors)
+            // and GNU tar / Python (which stop).  Return an error instead.
+            return Err(ParseError::StrayZeroBlock);
         }
 
         // Check pending entry limit
@@ -4290,5 +4300,85 @@ mod tests {
                 other
             ),
         }
+    }
+
+    // =========================================================================
+    // Stray zero block tests
+    // =========================================================================
+
+    /// A single all-zero 512-byte block appearing mid-stream (between two valid
+    /// entries) must be rejected.  Go's archive/tar returns ErrHeader; GNU tar
+    /// and Python stop at the first zero block (treating it as end-of-archive).
+    /// Silently skipping it creates a confusion window where tar-core sees more
+    /// entries than other parsers do.
+    #[test]
+    fn test_stray_zero_block_is_error() {
+        let mut archive = Vec::new();
+
+        // First valid file entry (0 bytes of content)
+        archive.extend_from_slice(&make_header(b"first.txt", 0, b'0'));
+
+        // Single all-zero 512-byte block — stray, not a valid EOA pair
+        archive.extend(zeroes(512));
+
+        // Second valid file entry — would be hidden from Go/GNU/Python parsers
+        archive.extend_from_slice(&make_header(b"second.txt", 0, b'0'));
+
+        // Two zero blocks for proper EOA
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+
+        // Consume the first entry
+        let event = parser.parse(&archive).unwrap();
+        let consumed = match event {
+            ParseEvent::Entry { consumed, entry } => {
+                assert_eq!(entry.path.as_ref(), b"first.txt");
+                consumed
+            }
+            other => panic!("Expected first Entry, got {:?}", other),
+        };
+
+        // The next parse call should encounter the stray zero block and error
+        let result = parser.parse(&archive[consumed..]);
+        assert!(
+            matches!(result, Err(ParseError::StrayZeroBlock)),
+            "Expected StrayZeroBlock error, got {:?}",
+            result
+        );
+    }
+
+    /// Two consecutive all-zero 512-byte blocks constitute a valid
+    /// end-of-archive marker and must still produce ParseEvent::End.
+    /// This is a regression guard for the normal EOA path.
+    #[test]
+    fn test_two_zero_blocks_is_valid_eoa() {
+        let mut archive = Vec::new();
+
+        // One valid file entry
+        archive.extend_from_slice(&make_header(b"file.txt", 0, b'0'));
+
+        // Two consecutive zero blocks = valid EOA
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+
+        // Consume the file entry
+        let event = parser.parse(&archive).unwrap();
+        let consumed = match event {
+            ParseEvent::Entry { consumed, entry } => {
+                assert_eq!(entry.path.as_ref(), b"file.txt");
+                consumed
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        };
+
+        // The two zero blocks should produce End, not an error
+        let event = parser.parse(&archive[consumed..]).unwrap();
+        assert!(
+            matches!(event, ParseEvent::End { .. }),
+            "Expected End for two-zero-block EOA, got {:?}",
+            event
+        );
     }
 }
