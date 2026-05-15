@@ -733,6 +733,26 @@ impl EntryType {
         self == EntryType::Fifo
     }
 
+    /// Returns true for entry types that carry no data content and must
+    /// therefore have a zero size field: hardlinks, symlinks, character/block
+    /// devices, directories, and FIFOs.
+    ///
+    /// A non-zero size on one of these entry types is a sign of a malformed or
+    /// malicious archive — different tar implementations disagree on how to
+    /// handle such a value, creating an archive confusion vector.
+    #[must_use]
+    pub fn is_header_only(self) -> bool {
+        matches!(
+            self,
+            EntryType::Link
+                | EntryType::Symlink
+                | EntryType::Char
+                | EntryType::Block
+                | EntryType::Directory
+                | EntryType::Fifo
+        )
+    }
+
     /// Returns true if this is a contiguous file entry.
     #[must_use]
     pub fn is_contiguous(self) -> bool {
